@@ -1,0 +1,29 @@
+name: Bug report
+description: Something does not work as the README says
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest code that shows the problem.
+      render: ts
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: mastra-weflayr, @mastra/core and Node.
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: Do not paste your Weflayr API key or any customer data.
