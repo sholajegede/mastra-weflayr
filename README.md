@@ -25,6 +25,12 @@ cost total per customer inside your Mastra app.
   stopped before the model is called, with a `tripwire` on the result you can
   turn into an upgrade prompt. Other customers carry on. It also stops a tool
   loop part way through.
+- **A softer landing first.** Before the stop, a customer who has used most of
+  their budget can be moved to a cheaper model, so they keep getting answers.
+- **A cap per run.** Limit what one run, or one workflow, may spend, so a
+  runaway tool loop can't burn a customer's month in one go.
+- **An agent that knows its budget.** A tool the agent can call to see what is
+  left, and plan its work around it.
 - **Named calls.** Each agent has a fixed call name, so Weflayr can replay that
   call's real traffic on other models and score the answers.
 - **Fallback that is priced correctly.** Put a direct model after the gateway in
@@ -100,13 +106,14 @@ const result = await classifier.generate(ticketText, {
 });
 
 if (result.tripwire?.metadata?.type === "weflayr-budget") {
-  // result.tripwire.metadata: { customer, month, limitUsd, spentUsd }
+  // result.tripwire.metadata: { scope: "month" or "run", customer, month, limitUsd, spentUsd }
   return showUpgradePrompt(result.tripwire.reason);
 }
 ```
 
-If you already pass Mastra's resource id for memory, the customer defaults to
-it, so you may not need to set anything.
+If your auth middleware already sets Mastra's resource id, the customer defaults
+to it, so you may not need to set anything. See
+[Set the customer from the login](#set-the-customer-from-the-login).
 
 The same run shows up in Weflayr under the feature `support`, the call
 `classify-ticket` and the customer `plausible`.
@@ -121,14 +128,106 @@ The same run shows up in Weflayr under the feature `support`, the call
 | `customer(rc)`   | Who the run is for. Default: the `weflayr-customer` context key, then Mastra's resource id     |
 | `plan(rc)`       | The customer's plan, sent to Weflayr as a tag                                                  |
 | `budget(c, rc)`  | Monthly dollars for a customer, or nothing for no limit                                        |
+| `runBudget`      | The most one run may spend, in dollars, or a function of the request context                  |
 | `spend`          | Where spend is kept. Default is in memory, see below                                           |
 | `onCall(record)` | Called after every step with customer, call, model, tokens and cost                            |
 | `onBudgetError`  | `"allow"` (default) runs the step if the budget check fails, `"block"` stops it                |
 
-Pieces you can use on their own: `weflayr.model()`, `weflayr.config()` (a fixed
-config for a scorer's judge model, where there is no request context),
+Pieces you can use on their own: `weflayr.model()`, `weflayr.config()`,
 `weflayr.budgetGuard()`, `weflayr.modelCapture()`, `weflayr.costTracker()`,
-`weflayr.budget(customer)` and `weflayr.estimateCost()`.
+`weflayr.budgetTool()`, `weflayr.budget(customer)`, `weflayr.runCost(rc)` and
+`weflayr.estimateCost()`.
+
+### Move to a cheaper model before the stop
+
+```ts
+...weflayr.agent({
+  call: "draft-reply",
+  model: "claude-opus-5-5",
+  downgrade: { model: "claude-haiku-5-5", at: 0.8 },
+}),
+```
+
+Once a customer has used 80% of their monthly budget, their new runs use the
+cheaper model. At 100% the budget guard stops them as usual. The request carries
+a `downgraded_from` tag, so Weflayr shows which calls were moved, and the step is
+priced as the cheaper model.
+
+### Cap one run
+
+```ts
+const weflayr = new Weflayr({
+  runBudget: (rc) => (rc.get("weflayr-plan") === "pro" ? 1 : 0.1),
+  // ...
+});
+```
+
+A run is everything done with one request context. The guard checks the run's
+spend before every step, so a tool loop stops once the run has used its budget,
+with `tripwire.metadata.scope` set to `"run"`. A workflow that passes one request
+context to several agents shares one run budget. `weflayr.runCost(rc)` returns
+what the run has spent.
+
+### Let the agent check its budget
+
+```ts
+const researcher = new Agent({
+  id: "research",
+  name: "Research",
+  instructions: "Check your budget before a long search. If little is left, give a shorter answer.",
+  tools: { checkBudget: weflayr.budgetTool() },
+  ...weflayr.agent({ call: "research", model: "claude-opus-5-5" }),
+});
+```
+
+The tool returns the customer's monthly limit, spend and what is left, and the
+same for the current run.
+
+### Set the customer from the login
+
+Set the customer once, in Mastra's server middleware, from whatever your auth
+already knows. Every agent call in that request is then tagged and budgeted
+without passing a request context by hand:
+
+```ts
+import { Mastra } from "@mastra/core";
+import { MASTRA_RESOURCE_ID_KEY } from "@mastra/core/request-context";
+
+export const mastra = new Mastra({
+  agents: { classifier },
+  server: {
+    middleware: [
+      async (c, next) => {
+        const workspaceId = await workspaceFromToken(c.req.header("authorization"));
+        c.get("requestContext").set(MASTRA_RESOURCE_ID_KEY, workspaceId);
+        await next();
+      },
+    ],
+  },
+});
+```
+
+`workspaceFromToken` is your own lookup. Mastra also uses the resource id to keep
+each user's memory separate, so one value does both jobs. To keep them apart,
+set the `weflayr-customer` key instead.
+
+### Track your scorers
+
+A scorer's judge model has no request context, so give it a fixed config. Its
+calls show up in Weflayr under their own call name, apart from your agents:
+
+```ts
+import { createScorer } from "@mastra/core/evals";
+
+export const tone = createScorer({
+  id: "tone",
+  description: "Rates the tone of a support reply.",
+  judge: {
+    model: weflayr.config("claude-haiku-5-5", { call: "judge-tone" }),
+    instructions: "You rate the tone of support replies.",
+  },
+});
+```
 
 ### Pick the model by plan
 
@@ -184,8 +283,9 @@ the same numbers in Convex tables.
 
 ## Limitations
 
-- The budget is checked before each step and spend is added after it, so a step
-  already running can push a customer past the limit.
+- Budgets are checked before each step and spend is added after it, so a step
+  already running can push a customer or a run past the limit.
+- A downgrade applies to new runs. A run that has already started keeps its model.
 - Cost is an estimate. A model that is not in `prices` is recorded with cost 0.
 - The default spend store is per process.
 - Exact pricing of a fallback model needs `modelCapture()`, which `agent()`
@@ -209,6 +309,10 @@ priced from them, and a customer, from the request context or the resource id.
 
 **The gateway returns 402.** Your Weflayr balance is empty.
 
+**A stopped run logs `TripWire` as an error.** That is Mastra logging the stop.
+The run did not crash, and the reason is on `result.tripwire`. Set your Mastra
+logger's level if you don't want it in the log.
+
 ## Try it
 
 ```sh
@@ -216,8 +320,10 @@ npm install
 WEFLAYR_API_KEY=<your key> npm run example
 ```
 
-`examples/live.ts` classifies one ticket for two customers, then gives one a tiny
-budget and shows the next run being stopped before the model is called.
+`examples/live.ts` classifies one ticket for two customers on Claude Opus 5.5.
+Then one customer gets a budget they have almost used, and their next run is
+moved to Claude Haiku 5.5. The other gets a budget they have already used, and
+their next run is stopped before the model is called. It costs well under a cent.
 
 ## Contributing
 

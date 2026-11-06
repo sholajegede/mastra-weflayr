@@ -13,5 +13,11 @@
   customer's monthly spend and calls `onCall`
 - `modelCapture()`: prices a fallback model as the model that answered
 - `agent()`: model, guard, model capture and tracker for one agent in one line
+- `downgrade`: move a customer to a cheaper model once they have used part of
+  their monthly budget
+- `runBudget`: cap what one run, or one workflow sharing a request context, may
+  spend; `runCost()` returns what a run has spent
+- `budgetTool()`: a tool the agent can call to see what is left of its budget
+- `BudgetTripwire.scope` says whether the monthly or the run budget stopped the run
 - `SpendStore` interface and an in-memory store
 - Needs `@mastra/core` 1.34 or later

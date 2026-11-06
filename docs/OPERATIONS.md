@@ -25,7 +25,8 @@ Make `add` an atomic increment.
 
 | Signal | Meaning | Action |
 | ------ | ------- | ------ |
-| `result.tripwire.metadata.type === "weflayr-budget"` | A customer hit their budget | Show them an upgrade prompt |
+| `result.tripwire.metadata.type === "weflayr-budget"` | A customer (`scope: "month"`) or a run (`scope: "run"`) hit its budget | Show an upgrade prompt, or a shorter answer for a run |
+| Header tag `downgraded_from` in Weflayr | A customer near their budget was moved to the cheaper model | Check whether the cheaper model still answers well |
 | Warning `could not check a budget` | Budget function or store failed; steps ran | Fix the store; consider `onBudgetError: "block"` |
 | Warning `could not record a step` | `onCall` or the store failed; the run was fine | Fix the sink |
 | Records with `costSource: "none"` | Model missing from `prices` | Add the price |
