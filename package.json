@@ -1,6 +1,6 @@
 {
   "name": "mastra-weflayr",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run Mastra agents on Weflayr routing strategies with every call tagged by customer and run, and stop a customer's run on their real AI cost or margin.",
   "type": "module",
   "main": "dist/index.cjs",
