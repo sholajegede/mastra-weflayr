@@ -3,6 +3,7 @@ import type {
   InputProcessor,
   OutputProcessor,
 } from "@mastra/core/processors";
+import { createTool } from "@mastra/core/tools";
 import {
   MASTRA_RESOURCE_ID_KEY,
   RequestContext,
@@ -20,6 +21,7 @@ export const TAGS_KEY = "weflayr-tags";
 export const BUDGET_GUARD_ID = "weflayr-budget-guard";
 export const MODEL_CAPTURE_ID = "weflayr-model-capture";
 export const COST_TRACKER_ID = "weflayr-cost-tracker";
+export const BUDGET_TOOL_ID = "weflayr-check-budget";
 
 /** Dollars per million tokens, by model id. */
 export type Prices = Record<
@@ -76,10 +78,21 @@ export type CallRecord = {
 /** What the budget guard puts on `result.tripwire.metadata` when it stops a run. */
 export type BudgetTripwire = {
   type: "weflayr-budget";
-  customer: string;
-  month: string;
+  /** "month" for the customer's monthly budget, "run" for the budget of one run. */
+  scope: "month" | "run";
+  customer?: string;
+  /** Set when scope is "month". */
+  month?: string;
   limitUsd: number;
   spentUsd: number;
+};
+
+/** Switch a customer to a cheaper model once they have used part of their monthly budget. */
+export type Downgrade = {
+  /** The model to use instead. */
+  model: string;
+  /** The share of the budget, from 0 to 1, after which new runs use `model`. Defaults to 0.8. */
+  at?: number;
 };
 
 export type BudgetStatus = {
@@ -113,6 +126,13 @@ export type WeflayrOptions = {
     customer: string,
     requestContext: RequestContext,
   ) => number | null | undefined | Promise<number | null | undefined>;
+  /**
+   * The most one run may spend, in dollars. A run is everything done with one request context, so a
+   * workflow that passes its request context to several agents shares one run budget.
+   */
+  runBudget?:
+    | number
+    | ((requestContext: RequestContext) => number | null | undefined);
   /** Defaults to a MemorySpendStore. Use your own store when you run more than one server. */
   spend?: SpendStore;
   /** Called after every model step with its tokens and cost. Errors here are logged and never fail the run. */
@@ -246,13 +266,47 @@ export class Weflayr {
    */
   model(
     modelId: ModelChoice,
-    options: { call: string },
-  ): (args: { requestContext: RequestContext }) => OpenAICompatibleConfig {
-    return ({ requestContext }) =>
-      this.config(this.resolveModel(modelId, requestContext), {
+    options: { call: string; downgrade?: Downgrade },
+  ): (args: {
+    requestContext: RequestContext;
+  }) => Promise<OpenAICompatibleConfig> {
+    return async ({ requestContext }) => {
+      const meta = this.read(requestContext);
+      const chosen = this.resolveModel(modelId, requestContext);
+      const cheaper = await this.downgradeTo(
+        chosen,
+        options.downgrade,
+        meta.customer,
+        requestContext,
+      );
+      return this.config(cheaper ?? chosen, {
         call: options.call,
-        ...this.read(requestContext),
+        ...meta,
+        tags: cheaper ? { ...meta.tags, downgraded_from: chosen } : meta.tags,
       });
+    };
+  }
+
+  private async downgradeTo(
+    chosen: string,
+    downgrade: Downgrade | undefined,
+    customer: string | undefined,
+    requestContext: RequestContext,
+  ): Promise<string | undefined> {
+    if (!downgrade || !customer || !this.options.budget) return undefined;
+    if (downgrade.model === chosen) return undefined;
+    try {
+      const status = await this.budget(customer, requestContext);
+      if (status.limitUsd === null) return undefined;
+      const at = Math.min(Math.max(downgrade.at ?? 0.8, 0), 1);
+      return status.spentUsd >= status.limitUsd * at ? downgrade.model : undefined;
+    } catch (error) {
+      console.warn(
+        "mastra-weflayr could not check a budget, so the usual model runs:",
+        describe(error),
+      );
+      return undefined;
+    }
   }
 
   /** Dollars for a step, or undefined when the model is not in the price table. */
@@ -304,6 +358,24 @@ export class Weflayr {
       id: BUDGET_GUARD_ID,
       processInputStep: async ({ requestContext, abort }) => {
         const { customer } = this.read(requestContext);
+        const runLimit = this.runLimit(requestContext);
+        if (runLimit !== null && requestContext) {
+          const spentUsd = this.runSpend.get(requestContext) ?? 0;
+          if (spentUsd >= runLimit) {
+            abort(
+              `This run has used ${dollars(spentUsd)} of its ${dollars(runLimit)} budget.`,
+              {
+                metadata: {
+                  type: "weflayr-budget",
+                  scope: "run",
+                  customer,
+                  limitUsd: runLimit,
+                  spentUsd,
+                },
+              },
+            );
+          }
+        }
         if (!customer || !this.options.budget) return;
         let status: BudgetStatus;
         try {
@@ -327,6 +399,7 @@ export class Weflayr {
           {
             metadata: {
               type: "weflayr-budget",
+              scope: "month",
               customer,
               month: status.month,
               limitUsd: status.limitUsd,
@@ -396,6 +469,12 @@ export class Weflayr {
             costSource: estimated === undefined ? "none" : "estimated",
             at,
           };
+          if (requestContext && record.costUsd > 0) {
+            this.runSpend.set(
+              requestContext,
+              (this.runSpend.get(requestContext) ?? 0) + record.costUsd,
+            );
+          }
           if (meta.customer && record.costUsd > 0) {
             await this.spend.add(meta.customer, currentMonth(at), record.costUsd);
           }
@@ -415,15 +494,67 @@ export class Weflayr {
    * The model, budget guard and cost tracker for one agent, with the same call name in all three.
    * Spread it into `new Agent({ ... })`.
    */
-  agent(options: { call: string; model: ModelChoice }) {
+  agent(options: { call: string; model: ModelChoice; downgrade?: Downgrade }) {
     return {
-      model: this.model(options.model, { call: options.call }),
+      model: this.model(options.model, {
+        call: options.call,
+        downgrade: options.downgrade,
+      }),
       inputProcessors: [this.budgetGuard(), this.modelCapture()],
       outputProcessors: [this.costTracker(options)],
     };
   }
 
+  /**
+   * A tool the agent can call to see how much of its budget is left, so it can plan around it.
+   * Add it to the agent's `tools`.
+   */
+  budgetTool() {
+    return createTool({
+      id: BUDGET_TOOL_ID,
+      description:
+        "Shows how much of the AI budget is left for this customer this month and for this run, in US dollars. Call it before expensive work.",
+      execute: async (_input, context) => {
+        const requestContext = context?.requestContext ?? new RequestContext();
+        const { customer } = this.read(requestContext);
+        const runLimit = this.runLimit(requestContext);
+        const runSpent = this.runSpend.get(requestContext) ?? 0;
+        const month = customer ? await this.budget(customer, requestContext) : null;
+        return {
+          customer: customer ?? null,
+          month: month && {
+            limitUsd: month.limitUsd,
+            spentUsd: month.spentUsd,
+            remainingUsd: month.remainingUsd,
+          },
+          run: {
+            limitUsd: runLimit,
+            spentUsd: runSpent,
+            remainingUsd:
+              runLimit === null ? null : Math.max(runLimit - runSpent, 0),
+          },
+        };
+      },
+    });
+  }
+
+  /** What this run has spent so far, in dollars. A run is everything done with one request context. */
+  runCost(requestContext: RequestContext): number {
+    return this.runSpend.get(requestContext) ?? 0;
+  }
+
+  private runLimit(requestContext: RequestContext | undefined): number | null {
+    const option = this.options.runBudget;
+    if (option === undefined) return null;
+    const limit =
+      typeof option === "function"
+        ? option(requestContext ?? new RequestContext())
+        : option;
+    return typeof limit === "number" ? limit : null;
+  }
+
   private readonly answered = new WeakMap<object, string>();
+  private readonly runSpend = new WeakMap<object, number>();
 
   private resolveModel(modelId: ModelChoice, requestContext: RequestContext) {
     return typeof modelId === "function" ? modelId(requestContext) : modelId;

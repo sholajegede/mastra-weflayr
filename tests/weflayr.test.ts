@@ -301,6 +301,7 @@ describe("budgets", () => {
     expect(result.tripwire?.processorId).toBe("weflayr-budget-guard");
     expect(result.tripwire?.metadata as BudgetTripwire).toEqual({
       type: "weflayr-budget",
+      scope: "month",
       customer: "acme",
       month: currentMonth(),
       limitUsd: 5,
@@ -397,6 +398,152 @@ describe("budgets", () => {
     });
     expect(await weflayr.budget("acme", undefined, "2026-12")).toMatchObject({ spentUsd: 0 });
     expect(await new Weflayr().budget("acme")).toMatchObject({ limitUsd: null, allowed: true });
+  });
+});
+
+describe("downgrade, run budgets and the budget tool", () => {
+  test("a customer past the downgrade point gets the cheaper model, priced as itself and tagged", async () => {
+    const seen = fakeGateway([{ text: "ok", input: 1000, output: 100 }]);
+    const spend = new MemorySpendStore();
+    spend.add("acme", currentMonth(), 8.5);
+    spend.add("globex", currentMonth(), 1);
+    const calls: CallRecord[] = [];
+    const weflayr = new Weflayr({
+      apiKey: "wf-test",
+      prices: PRICES,
+      spend,
+      budget: () => 10,
+      onCall: (record) => void calls.push(record),
+    });
+    const agent = new Agent({
+      id: "draft",
+      name: "draft",
+      instructions: "Answer.",
+      ...weflayr.agent({
+        call: "draft-reply",
+        model: "claude-opus-5-5",
+        downgrade: { model: "claude-haiku-5-5", at: 0.8 },
+      }),
+    });
+
+    await agent.generate("hi", { requestContext: weflayr.context({ customer: "acme" }) });
+    await agent.generate("hi", { requestContext: weflayr.context({ customer: "globex" }) });
+
+    expect(seen.map((request) => request.body.model)).toEqual(["claude-haiku-5-5", "claude-opus-5-5"]);
+    expect(metadataOf(seen[0]).tags).toEqual({ downgraded_from: "claude-opus-5-5" });
+    expect(metadataOf(seen[1]).tags).toBeUndefined();
+    expect(calls.map((record) => record.model)).toEqual(["claude-haiku-5-5", "claude-opus-5-5"]);
+    expect(calls[0]!.costUsd).toBeCloseTo(0.00015, 10);
+  });
+
+  test("no downgrade without a budget, and a failed budget check keeps the usual model", async () => {
+    const seen = fakeGateway();
+    const plain = new Weflayr({ apiKey: "wf-test" });
+    const broken = new Weflayr({
+      apiKey: "wf-test",
+      budget: () => {
+        throw new Error("plans table unavailable");
+      },
+    });
+    for (const weflayr of [plain, broken]) {
+      const agent = new Agent({
+        id: "draft",
+        name: "draft",
+        instructions: "Answer.",
+        ...weflayr.agent({ call: "draft-reply", model: "claude-opus-5-5", downgrade: { model: "claude-haiku-5-5" } }),
+      });
+      await agent.generate("hi", { requestContext: weflayr.context({ customer: "acme" }) });
+    }
+    expect(seen.map((request) => request.body.model)).toEqual(["claude-opus-5-5", "claude-opus-5-5"]);
+  });
+
+  test("a run budget stops a tool loop once the run has spent it, and the next run starts fresh", async () => {
+    const seen = fakeGateway([
+      { toolCall: { name: "lookup", args: { id: "1" } }, input: 100_000, output: 10_000 },
+      { text: "done" },
+    ]);
+    const weflayr = new Weflayr({ apiKey: "wf-test", prices: PRICES, runBudget: 0.01 });
+    const agent = new Agent({
+      id: "support",
+      name: "support",
+      instructions: "Use the tool.",
+      tools: { lookup },
+      ...weflayr.agent({ call: "support-reply", model: "claude-haiku-5-5" }),
+    });
+
+    const first = weflayr.context({ customer: "acme" });
+    const result = await agent.generate("hi", { requestContext: first, maxSteps: 5 });
+
+    expect(seen).toHaveLength(1);
+    expect(weflayr.runCost(first)).toBeCloseTo(0.015, 10);
+    expect(result.tripwire?.reason).toBe("This run has used $0.015 of its $0.01 budget.");
+    expect(result.tripwire?.metadata as BudgetTripwire).toEqual({
+      type: "weflayr-budget",
+      scope: "run",
+      customer: "acme",
+      limitUsd: 0.01,
+      spentUsd: 0.015,
+    });
+
+    const second = await agent.generate("hi", {
+      requestContext: weflayr.context({ customer: "acme" }),
+      maxSteps: 5,
+    });
+    expect(second.tripwire).toBeUndefined();
+  });
+
+  test("agents that share one request context share one run budget, and the limit can depend on the request", async () => {
+    const seen = fakeGateway([{ text: "ok", input: 100_000, output: 0 }]);
+    const weflayr = new Weflayr({
+      apiKey: "wf-test",
+      prices: PRICES,
+      runBudget: (rc) => (rc.get("weflayr-plan") === "pro" ? 1 : 0.005),
+    });
+    const research = newAgent(weflayr, "research");
+    const summarise = newAgent(weflayr, "summarise");
+
+    const free = weflayr.context({ customer: "acme", plan: "free" });
+    await research.generate("hi", { requestContext: free });
+    const stopped = await summarise.generate("hi", { requestContext: free });
+
+    const pro = weflayr.context({ customer: "acme", plan: "pro" });
+    await research.generate("hi", { requestContext: pro });
+    const ran = await summarise.generate("hi", { requestContext: pro });
+
+    expect(stopped.tripwire?.metadata).toMatchObject({ scope: "run" });
+    expect(ran.tripwire).toBeUndefined();
+    expect(seen).toHaveLength(3);
+  });
+
+  test("the budget tool tells the agent what is left for the month and the run", async () => {
+    const seen = fakeGateway([
+      { toolCall: { name: "checkBudget", args: {} }, input: 1000, output: 100 },
+      { text: "plenty left" },
+    ]);
+    const spend = new MemorySpendStore();
+    spend.add("acme", currentMonth(), 4);
+    const weflayr = new Weflayr({ apiKey: "wf-test", prices: PRICES, spend, budget: () => 10, runBudget: 1 });
+    const agent = new Agent({
+      id: "support",
+      name: "support",
+      instructions: "Check the budget first.",
+      tools: { checkBudget: weflayr.budgetTool() },
+      ...weflayr.agent({ call: "support-reply", model: "claude-haiku-5-5" }),
+    });
+
+    const result = await agent.generate("hi", {
+      requestContext: weflayr.context({ customer: "acme" }),
+      maxSteps: 3,
+    });
+
+    expect(result.text).toBe("plenty left");
+    const toolResult = result.steps[0]?.toolResults[0] as { payload?: { result?: unknown }; result?: unknown } | undefined;
+    expect(toolResult?.payload?.result ?? toolResult?.result).toEqual({
+      customer: "acme",
+      month: { limitUsd: 10, spentUsd: 4.00015, remainingUsd: 5.99985 },
+      run: { limitUsd: 1, spentUsd: 0.00015, remainingUsd: 0.99985 },
+    });
+    expect(JSON.stringify(seen[1]?.body)).toContain("remainingUsd");
   });
 });
 
