@@ -2,49 +2,39 @@
 
 ## Run it in production
 
-1. Set `WEFLAYR_API_KEY` on every server.
-2. Give `Weflayr` a `SpendStore` backed by your database. The default memory
-   store counts per process, so with two servers a customer can spend twice
-   their budget.
-3. Fill `prices` for every model you use, in dollars per million tokens.
-4. Name every call and list it in `features`. Weflayr benchmarks are set up per
-   call name, so keep names stable.
-
-A `SpendStore` is two methods:
-
-```ts
-const spend: SpendStore = {
-  get: async (customer, month) => (await db.spend.find(customer, month)) ?? 0,
-  add: async (customer, month, usd) => db.spend.increment(customer, month, usd),
-};
-```
-
-Make `add` an atomic increment.
+1. Set `WEFLAYR_API_KEY` (Gateway scope) and `WEFLAYR_MANAGEMENT_KEY`
+   (Management scope) on every server. One key with both scopes also works.
+2. Pin a strategy version in production: `strategy("support-default", 4)`.
+   Follow the latest in development.
+3. Set the customer from your login, so every call carries it.
+4. Bring revenue into Weflayr: connect Stripe in Weflayr, or call
+   `weflayr.api.setRevenue` from your billing webhook with `revenue_id` set. Use
+   one source per customer and month.
+5. Use `spend: "weflayr"` for budgets. With several servers, each one reads the
+   same figure from Weflayr, so budgets hold across servers.
+6. Name every call and list it in `features`. Benchmarks are set up per call
+   name, so keep names stable.
 
 ## What to watch
 
 | Signal | Meaning | Action |
 | ------ | ------- | ------ |
-| `result.tripwire.metadata.type === "weflayr-budget"` | A customer (`scope: "month"`) or a run (`scope: "run"`) hit its budget | Show an upgrade prompt, or a shorter answer for a run |
-| Header tag `downgraded_from` in Weflayr | A customer near their budget was moved to the cheaper model | Check whether the cheaper model still answers well |
-| Warning `could not check a budget` | Budget function or store failed; steps ran | Fix the store; consider `onBudgetError: "block"` |
-| Warning `could not record a step` | `onCall` or the store failed; the run was fine | Fix the sink |
-| Records with `costSource: "none"` | Model missing from `prices` | Add the price |
-| Gateway 402 | Weflayr balance is empty | Add credit in the dashboard |
+| `result.tripwire.metadata.scope === "month"` | A customer used their monthly budget | Show an upgrade prompt |
+| `scope === "margin"` | A customer's margin status is one you stop on | Review their plan or price |
+| `scope === "run"` | One run hit its cap | Give a shorter answer, or ask the user to narrow the task |
+| `onWarnings` called | The gateway changed a request for the model it picked | Remove the setting, or check the strategy's models |
+| Warning `could not check a budget` | Weflayr or your budget function failed; the step ran | Check the management key; consider `onBudgetError: "block"` |
+| `unknown_routing_strategy` | The strategy id or version is not in this key's project | Fix the id or the pinned version |
+| Gateway 402 | Weflayr balance is empty | Add credit |
+
+Weflayr can also email or post to Slack when cost or margin crosses a threshold.
+Set that up in Weflayr rather than in your app.
 
 ## Gateway outage
 
-List a direct model after the gateway model in Mastra's model list:
-
-```ts
-model: [
-  { model: weflayr.model("claude-haiku-5-5", { call: "reply" }), maxRetries: 1 },
-  { model: { id: "anthropic/claude-haiku-5-5" }, maxRetries: 1 },
-],
-```
-
-Mastra moves to the next entry if the gateway fails, and `modelCapture` prices
-the step as the model that answered. Calls that go direct do not appear in
+Inside a strategy, Weflayr already falls back across models, providers and
+regions. For the gateway itself being unreachable, list a direct model after the
+gateway model in Mastra's model list (see the README). Those calls do not reach
 Weflayr.
 
 ## Upgrades

@@ -1,7 +1,7 @@
 {
   "name": "mastra-weflayr",
   "version": "0.1.0",
-  "description": "Send a Mastra agent's model calls through the Weflayr gateway, tagged with the customer, and stop a customer's run once they have used their monthly AI budget.",
+  "description": "Run Mastra agents on Weflayr routing strategies with every call tagged by customer and run, and stop a customer's run on their real AI cost or margin.",
   "type": "module",
   "main": "dist/index.cjs",
   "types": "dist/index.d.cts",
@@ -35,7 +35,9 @@
     "weflayr",
     "ai-gateway",
     "llm",
-    "cost-tracking",
+    "routing",
+    "model-routing",
+    "margin",
     "budgets",
     "agents",
     "multi-tenant"
