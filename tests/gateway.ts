@@ -6,18 +6,37 @@ export type SeenRequest = {
   body: { model: string; stream?: boolean; [key: string]: unknown };
 };
 
+type Answer = { input?: number; output?: number; answeredBy?: string; warnings?: unknown[] };
 type Reply =
-  | { text: string; input?: number; output?: number }
-  | { toolCall: { name: string; args: unknown }; input?: number; output?: number };
+  | ({ text: string } & Answer)
+  | ({ toolCall: { name: string; args: unknown } } & Answer);
+
+export type ManagementCall = { path: string; body: Record<string, unknown>; auth: string | undefined };
 
 /**
  * Replaces fetch with a fake OpenAI compatible gateway. Each request takes the next reply.
  * Returns the list of requests it received.
  */
-export function fakeGateway(replies: Reply[] = [{ text: "hello" }]) {
+export function fakeGateway(
+  replies: Reply[] = [{ text: "hello" }],
+  management?: (call: ManagementCall) => unknown,
+  managementSeen: ManagementCall[] = [],
+) {
   const seen: SeenRequest[] = [];
   let index = 0;
   vi.stubGlobal("fetch", async (input: string | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith("https://app.weflayr.com/api")) {
+      const call: ManagementCall = {
+        path: url.slice("https://app.weflayr.com/api".length),
+        body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+        auth: new Headers(init?.headers).get("authorization") ?? undefined,
+      };
+      managementSeen.push(call);
+      const answer = management ? management(call) : { rows: [], next_cursor: null, has_more: false };
+      if (answer instanceof Response) return answer;
+      return new Response(JSON.stringify(answer), { headers: { "content-type": "application/json" } });
+    }
     const body = JSON.parse(String(init?.body ?? "{}")) as SeenRequest["body"];
     seen.push({
       url: String(input),
@@ -59,8 +78,8 @@ export function fakeGateway(replies: Reply[] = [{ text: "hello" }]) {
             }
           : { role: "assistant", content: reply.text };
       const chunks = [
-        { id: "x", object: "chat.completion.chunk", created: 1, model: body.model, choices: [{ index: 0, delta, finish_reason: null }] },
-        { id: "x", object: "chat.completion.chunk", created: 1, model: body.model, choices: [{ index: 0, delta: {}, finish_reason: finish }], usage },
+        { id: "x", object: "chat.completion.chunk", created: 1, model: reply.answeredBy ?? body.model, choices: [{ index: 0, delta, finish_reason: null }] },
+        { id: "x", object: "chat.completion.chunk", created: 1, model: reply.answeredBy ?? body.model, choices: [{ index: 0, delta: {}, finish_reason: finish }], usage },
       ];
       const text =
         chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") +
@@ -74,7 +93,8 @@ export function fakeGateway(replies: Reply[] = [{ text: "hello" }]) {
         id: "x",
         object: "chat.completion",
         created: 1,
-        model: body.model,
+        model: reply.answeredBy ?? body.model,
+        ...(reply.warnings ? { weflayr_warnings: reply.warnings } : {}),
         choices: [{ index: 0, message, finish_reason: finish }],
         usage,
       }),
@@ -89,6 +109,7 @@ export function metadataOf(request: SeenRequest | undefined) {
     feature_name: string;
     call_name: string;
     customer_name?: string;
+    feature_run_uuid?: string;
     tags?: Record<string, string>;
   };
 }

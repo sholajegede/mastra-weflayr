@@ -12,9 +12,17 @@ import {
   GATEWAY_URL,
   MemorySpendStore,
   Weflayr,
+  WeflayrApi,
+  WeflayrApiError,
+  WeflayrSpendStore,
   currentMonth,
+  monthRange,
+  newRunId,
+  strategy,
 } from "../src/index.js";
-import { fakeGateway, metadataOf } from "./gateway.js";
+import { type ManagementCall, fakeGateway, metadataOf } from "./gateway.js";
+
+const RUN = "0123456789abcdef0123456789abcdef";
 
 const PRICES = {
   "claude-haiku-5-5": { inputPerMillion: 0.1, outputPerMillion: 0.5 },
@@ -49,7 +57,7 @@ describe("routing through the gateway", () => {
       features: { "support-reply": "support" },
     });
     const result = await newAgent(weflayr).generate("hi", {
-      requestContext: weflayr.context({ customer: "acme", plan: "pro", runId: "run-1" }),
+      requestContext: weflayr.context({ customer: "acme", plan: "pro", runId: RUN }),
     });
 
     expect(result.text).toBe("hello");
@@ -61,7 +69,8 @@ describe("routing through the gateway", () => {
       feature_name: "support",
       call_name: "support-reply",
       customer_name: "acme",
-      tags: { plan: "pro", run_id: "run-1" },
+      feature_run_uuid: RUN,
+      tags: { plan: "pro" },
     });
   });
 
@@ -114,6 +123,7 @@ describe("routing through the gateway", () => {
     expect(metadataOf(seen[0])).toEqual({
       feature_name: "other",
       call_name: "support-reply",
+      feature_run_uuid: expect.stringMatching(/^[0-9a-f]{32}$/),
     });
   });
 
@@ -191,14 +201,14 @@ describe("cost tracking", () => {
       },
     });
     await newAgent(weflayr).generate("hi", {
-      requestContext: weflayr.context({ customer: "acme", plan: "pro", runId: "run-9" }),
+      requestContext: weflayr.context({ customer: "acme", plan: "pro", runId: RUN }),
     });
 
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({
       customer: "acme",
       plan: "pro",
-      runId: "run-9",
+      runId: RUN,
       call: "support-reply",
       feature: "support",
       model: "claude-haiku-5-5",
@@ -401,62 +411,7 @@ describe("budgets", () => {
   });
 });
 
-describe("downgrade, run budgets and the budget tool", () => {
-  test("a customer past the downgrade point gets the cheaper model, priced as itself and tagged", async () => {
-    const seen = fakeGateway([{ text: "ok", input: 1000, output: 100 }]);
-    const spend = new MemorySpendStore();
-    spend.add("acme", currentMonth(), 8.5);
-    spend.add("globex", currentMonth(), 1);
-    const calls: CallRecord[] = [];
-    const weflayr = new Weflayr({
-      apiKey: "wf-test",
-      prices: PRICES,
-      spend,
-      budget: () => 10,
-      onCall: (record) => void calls.push(record),
-    });
-    const agent = new Agent({
-      id: "draft",
-      name: "draft",
-      instructions: "Answer.",
-      ...weflayr.agent({
-        call: "draft-reply",
-        model: "claude-opus-5-5",
-        downgrade: { model: "claude-haiku-5-5", at: 0.8 },
-      }),
-    });
-
-    await agent.generate("hi", { requestContext: weflayr.context({ customer: "acme" }) });
-    await agent.generate("hi", { requestContext: weflayr.context({ customer: "globex" }) });
-
-    expect(seen.map((request) => request.body.model)).toEqual(["claude-haiku-5-5", "claude-opus-5-5"]);
-    expect(metadataOf(seen[0]).tags).toEqual({ downgraded_from: "claude-opus-5-5" });
-    expect(metadataOf(seen[1]).tags).toBeUndefined();
-    expect(calls.map((record) => record.model)).toEqual(["claude-haiku-5-5", "claude-opus-5-5"]);
-    expect(calls[0]!.costUsd).toBeCloseTo(0.00015, 10);
-  });
-
-  test("no downgrade without a budget, and a failed budget check keeps the usual model", async () => {
-    const seen = fakeGateway();
-    const plain = new Weflayr({ apiKey: "wf-test" });
-    const broken = new Weflayr({
-      apiKey: "wf-test",
-      budget: () => {
-        throw new Error("plans table unavailable");
-      },
-    });
-    for (const weflayr of [plain, broken]) {
-      const agent = new Agent({
-        id: "draft",
-        name: "draft",
-        instructions: "Answer.",
-        ...weflayr.agent({ call: "draft-reply", model: "claude-opus-5-5", downgrade: { model: "claude-haiku-5-5" } }),
-      });
-      await agent.generate("hi", { requestContext: weflayr.context({ customer: "acme" }) });
-    }
-    expect(seen.map((request) => request.body.model)).toEqual(["claude-opus-5-5", "claude-opus-5-5"]);
-  });
-
+describe("run budgets and the budget tool", () => {
   test("a run budget stops a tool loop once the run has spent it, and the next run starts fresh", async () => {
     const seen = fakeGateway([
       { toolCall: { name: "lookup", args: { id: "1" } }, input: 100_000, output: 10_000 },
@@ -542,8 +497,235 @@ describe("downgrade, run budgets and the budget tool", () => {
       customer: "acme",
       month: { limitUsd: 10, spentUsd: 4.00015, remainingUsd: 5.99985 },
       run: { limitUsd: 1, spentUsd: 0.00015, remainingUsd: 0.99985 },
+      marginStatus: null,
     });
     expect(JSON.stringify(seen[1]?.body)).toContain("remainingUsd");
+  });
+});
+
+describe("Weflayr runs, strategies and warnings", () => {
+  test("every step of one request context shares one feature run, and a new context starts a new one", async () => {
+    const seen = fakeGateway([
+      { toolCall: { name: "lookup", args: { id: "1" } } },
+      { text: "done" },
+      { text: "second" },
+      { text: "third" },
+    ]);
+    const weflayr = new Weflayr({ apiKey: "wf-test" });
+    const agent = new Agent({
+      id: "support",
+      name: "support",
+      instructions: "Use the tool.",
+      tools: { lookup },
+      ...weflayr.agent({ call: "support-reply", model: "claude-haiku-5-5" }),
+    });
+    const summarise = newAgent(weflayr, "summarise");
+
+    const shared = weflayr.context({ customer: "acme" });
+    await agent.generate("hi", { requestContext: shared, maxSteps: 3 });
+    await summarise.generate("hi", { requestContext: shared });
+    await summarise.generate("hi", { requestContext: weflayr.context({ customer: "acme" }) });
+
+    const runs = seen.map((request) => metadataOf(request).feature_run_uuid);
+    expect(runs[0]).toMatch(/^[0-9a-f]{32}$/);
+    expect(runs.slice(0, 3)).toEqual([runs[0], runs[0], runs[0]]);
+    expect(runs[3]).not.toBe(runs[0]);
+    expect(weflayr.runId(shared)).toBe(runs[0]);
+  });
+
+  test("a run id must have Weflayr's shape, and newRunId() makes one", () => {
+    const weflayr = new Weflayr({ apiKey: "wf-test" });
+    expect(newRunId()).toMatch(/^[0-9a-f]{32}$/);
+    expect(() => weflayr.context({ runId: "run-1" })).toThrow("32 lowercase hex");
+  });
+
+  test("a routing strategy is sent as the model, and the step is recorded as the model it picked", async () => {
+    const seen = fakeGateway([{ text: "ok", input: 1000, output: 100, answeredBy: "claude-opus-5-5" }]);
+    const calls: CallRecord[] = [];
+    const weflayr = new Weflayr({ apiKey: "wf-test", prices: PRICES, onCall: (record) => void calls.push(record) });
+    const agent = new Agent({
+      id: "draft",
+      name: "draft",
+      instructions: "Answer.",
+      ...weflayr.agent({ call: "draft-reply", model: strategy("production", 3) }),
+    });
+
+    await agent.generate("hi", { requestContext: weflayr.context({ customer: "acme" }) });
+
+    expect(strategy("production")).toBe("strategy/production");
+    expect(seen[0]!.body.model).toBe("strategy/production:3");
+    expect(calls[0]).toMatchObject({ model: "claude-opus-5-5", costSource: "estimated" });
+    expect(calls[0]!.costUsd).toBeCloseTo(0.006, 10);
+  });
+
+  test("a streamed strategy call is recorded as the model it picked", async () => {
+    fakeGateway([{ text: "ok", answeredBy: "claude-opus-5-5" }]);
+    const calls: CallRecord[] = [];
+    const weflayr = new Weflayr({ apiKey: "wf-test", onCall: (record) => void calls.push(record) });
+    const agent = new Agent({
+      id: "draft",
+      name: "draft",
+      instructions: "Answer.",
+      ...weflayr.agent({ call: "draft-reply", model: strategy("production") }),
+    });
+    const stream = await agent.stream("hi", { requestContext: weflayr.context({ customer: "acme" }) });
+    await stream.text;
+    expect(calls[0]?.model).toBe("claude-opus-5-5");
+  });
+
+  test("the gateway's warnings are passed to onWarnings and kept on the record", async () => {
+    fakeGateway([{ text: "ok", warnings: [{ parameter: "temperature", action: "removed" }] }]);
+    const calls: CallRecord[] = [];
+    const warned: unknown[][] = [];
+    const weflayr = new Weflayr({
+      apiKey: "wf-test",
+      onCall: (record) => void calls.push(record),
+      onWarnings: (warnings) => void warned.push(warnings),
+    });
+    await newAgent(weflayr).generate("hi", { requestContext: weflayr.context({ customer: "acme" }) });
+    expect(warned).toEqual([[{ parameter: "temperature", action: "removed" }]]);
+    expect(calls[0]?.warnings).toEqual([{ parameter: "temperature", action: "removed" }]);
+  });
+});
+
+describe("Weflayr's management API", () => {
+  test("cost and margin are read with the management key, for the customer's month", async () => {
+    const seen: ManagementCall[] = [];
+    fakeGateway(
+      [],
+      (call) =>
+        call.path === "/costs/"
+          ? { rows: [{ date_from: "2026-02-01", date_to: "2026-02-28", customer: "acme", cost: 4.25 }], next_cursor: null, has_more: false }
+          : { rows: [{ date_from: "2026-02-01", date_to: "2026-02-28", customer: "acme", revenue: 10, cost: 4.25, margin: 5.75, margin_pct: 57.5, risk_status: "watch" }], next_cursor: null, has_more: false },
+      seen,
+    );
+    const api = new WeflayrApi({ apiKey: "wf-manage" });
+
+    expect(await api.customerCost("acme", "2026-02")).toBe(4.25);
+    expect((await api.customerMargin("acme", "2026-02"))?.risk_status).toBe("watch");
+    expect(seen[0]).toEqual({
+      path: "/costs/",
+      auth: "Bearer wf-manage",
+      body: { date_from: "2026-02-01", date_to: "2026-02-28", aggregate: "all", group_by: "customer", customers: ["acme"] },
+    });
+    expect(seen[1]!.path).toBe("/margin/");
+    expect(monthRange("2028-02")).toEqual({ from: "2028-02-01", to: "2028-02-29" });
+  });
+
+  test("revenue and customer tags are sent 1,000 rows at a time, as upserts", async () => {
+    const seen: ManagementCall[] = [];
+    fakeGateway([], (call) => ({ ok: true, rows_inserted: (call.body.rows as unknown[] | undefined)?.length, customers_updated: (call.body.customers as unknown[] | undefined)?.length }), seen);
+    const weflayr = new Weflayr({ managementKey: "wf-manage" });
+    const rows = Array.from({ length: 1500 }, (_, i) => ({ customer_name: `c${i}`, amount: 10, month: "2026-11", revenue_id: `inv_${i}` }));
+
+    expect(await weflayr.api.setRevenue(rows)).toEqual({ rowsInserted: 1500 });
+    expect(await weflayr.tagCustomers({ acme: { plan: "pro" }, globex: { trial: null } })).toEqual({ customersUpdated: 2 });
+
+    expect(seen.map((call) => call.path)).toEqual(["/revenue/", "/revenue/", "/customer-tags/"]);
+    expect((seen[0]!.body.rows as unknown[]).length).toBe(1000);
+    expect(seen[0]!.body.upsert).toBe(true);
+    expect(seen[2]!.body).toEqual({
+      customers: [
+        { customer_name: "acme", tags: { plan: "pro" } },
+        { customer_name: "globex", tags: { trial: null } },
+      ],
+      upsert: true,
+    });
+  });
+
+  test("an error from Weflayr names the route, the status and the message", async () => {
+    fakeGateway([], () => new Response(JSON.stringify({ error: "Margin is only available on revenue-linked projects" }), { status: 400 }));
+    const error = await new WeflayrApi({ apiKey: "k" }).customerMargin("acme", "2026-11").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(WeflayrApiError);
+    expect((error as WeflayrApiError).status).toBe(400);
+    expect((error as Error).message).toBe("Weflayr /margin/ answered 400: Margin is only available on revenue-linked projects");
+  });
+
+  test("a missing management key fails with a clear message", async () => {
+    vi.stubEnv("WEFLAYR_API_KEY", "");
+    vi.stubEnv("WEFLAYR_MANAGEMENT_KEY", "");
+    await expect(new WeflayrApi().customerCost("acme", "2026-11")).rejects.toThrow("WEFLAYR_MANAGEMENT_KEY");
+    vi.unstubAllEnvs();
+  });
+});
+
+describe("real spend and margin from Weflayr", () => {
+  test("the spend store reads Weflayr's cost, adds recent estimates, and reads again after refreshMs", async () => {
+    let cost = 2;
+    const seen: ManagementCall[] = [];
+    fakeGateway([], () => ({ rows: [{ date_from: "", date_to: "", customer: "acme", cost }], next_cursor: null, has_more: false }), seen);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const store = new WeflayrSpendStore(new WeflayrApi({ apiKey: "k" }), { refreshMs: 60_000, settleMs: 300_000 });
+
+    expect(await store.get("acme", "2026-11")).toBe(2);
+    store.add("acme", "2026-11", 0.5);
+    expect(await store.get("acme", "2026-11")).toBe(2.5);
+    expect(seen).toHaveLength(1);
+
+    cost = 2.5;
+    vi.advanceTimersByTime(61_000);
+    // Weflayr now includes the step, which is still inside the settle window, so the total reads high, never low.
+    expect(await store.get("acme", "2026-11")).toBe(3);
+    vi.advanceTimersByTime(400_000);
+    expect(await store.get("acme", "2026-11")).toBe(2.5);
+    expect(seen).toHaveLength(3);
+    vi.useRealTimers();
+  });
+
+  test("when Weflayr can't be read, the last figure is used, and with none the read fails", async () => {
+    let up = true;
+    fakeGateway([], () => (up ? { rows: [{ date_from: "", date_to: "", cost: 1 }], next_cursor: null, has_more: false } : new Response("down", { status: 503 })));
+    const store = new WeflayrSpendStore(new WeflayrApi({ apiKey: "k" }), { refreshMs: 0 });
+    expect(await store.get("acme", "2026-11")).toBe(1);
+    up = false;
+    expect(await store.get("acme", "2026-11")).toBe(1);
+    await expect(store.get("globex", "2026-11")).rejects.toThrow("503");
+  });
+
+  test('with spend: "weflayr", a customer whose real cost has reached the budget is stopped', async () => {
+    const seen = fakeGateway([{ text: "ok" }], (call) => ({
+      rows: [{ date_from: "", date_to: "", customer: "x", cost: (call.body.customers as string[])[0] === "acme" ? 5 : 1 }],
+      next_cursor: null,
+      has_more: false,
+    }));
+    const weflayr = new Weflayr({ apiKey: "wf-test", managementKey: "wf-manage", spend: "weflayr", budget: () => 5 });
+    const stopped = await newAgent(weflayr).generate("hi", { requestContext: weflayr.context({ customer: "acme" }) });
+    const ran = await newAgent(weflayr).generate("hi", { requestContext: weflayr.context({ customer: "globex" }) });
+    expect(stopped.tripwire?.metadata).toMatchObject({ scope: "month", spentUsd: 5, limitUsd: 5 });
+    expect(ran.text).toBe("ok");
+    expect(seen).toHaveLength(1);
+  });
+
+  test("a customer whose margin status is in stopOnMargin is stopped, others run", async () => {
+    const seen = fakeGateway([{ text: "ok" }], (call) => ({
+      rows: [{ date_from: "", date_to: "", customer: "x", revenue: 1, cost: 2, margin: -1, margin_pct: -100, risk_status: (call.body.customers as string[])[0] === "acme" ? "unprofitable" : "healthy" }],
+      next_cursor: null,
+      has_more: false,
+    }));
+    const weflayr = new Weflayr({ apiKey: "wf-test", managementKey: "wf-manage", stopOnMargin: ["unprofitable"] });
+    const stopped = await newAgent(weflayr).generate("hi", { requestContext: weflayr.context({ customer: "acme" }) });
+    const ran = await newAgent(weflayr).generate("hi", { requestContext: weflayr.context({ customer: "globex" }) });
+
+    expect(stopped.tripwire?.reason).toBe("acme is unprofitable on AI margin this month.");
+    expect(stopped.tripwire?.metadata as BudgetTripwire).toEqual({
+      type: "weflayr-budget",
+      scope: "margin",
+      customer: "acme",
+      month: currentMonth(),
+      riskStatus: "unprofitable",
+    });
+    expect(ran.text).toBe("ok");
+    expect(seen).toHaveLength(1);
+  });
+
+  test("margin status is cached for marginRefreshMs", async () => {
+    const seen: ManagementCall[] = [];
+    fakeGateway([{ text: "ok" }], () => ({ rows: [{ date_from: "", date_to: "", revenue: 1, cost: 0, margin: 1, margin_pct: 100, risk_status: "healthy" }], next_cursor: null, has_more: false }), seen);
+    const weflayr = new Weflayr({ apiKey: "wf-test", managementKey: "k", stopOnMargin: ["unprofitable"] });
+    await weflayr.margin("acme");
+    await weflayr.margin("acme");
+    expect(seen).toHaveLength(1);
+    expect(await weflayr.margin("acme")).toMatchObject({ riskStatus: "healthy", marginPct: 100 });
   });
 });
 

@@ -3,11 +3,21 @@ import type {
   InputProcessor,
   OutputProcessor,
 } from "@mastra/core/processors";
-import { createTool } from "@mastra/core/tools";
 import {
   MASTRA_RESOURCE_ID_KEY,
   RequestContext,
 } from "@mastra/core/request-context";
+import { createTool } from "@mastra/core/tools";
+import { type RiskStatus, WeflayrApi } from "./api.js";
+import {
+  MemorySpendStore,
+  type SpendStore,
+  WeflayrSpendStore,
+  type WeflayrSpendOptions,
+} from "./spend.js";
+
+export * from "./api.js";
+export * from "./spend.js";
 
 export const GATEWAY_URL = "https://gateway.weflayr.com/v1";
 export const METADATA_HEADER = "x-weflayr-metadata";
@@ -33,66 +43,46 @@ export type Prices = Record<
 export type CallContext = {
   customer?: string;
   plan?: string;
+  /** Weflayr's feature run id: 32 lowercase hex characters. Made for you when you leave it out. */
   runId?: string;
   tags?: Record<string, string>;
 };
-
-/** Where each customer's spend for the month is kept. */
-export interface SpendStore {
-  get(customer: string, month: string): number | Promise<number>;
-  add(customer: string, month: string, usd: number): void | Promise<void>;
-}
-
-/** Keeps spend in memory. It is reset when the process restarts and is not shared between servers. */
-export class MemorySpendStore implements SpendStore {
-  private totals = new Map<string, number>();
-
-  get(customer: string, month: string): number {
-    return this.totals.get(`${customer}\u0000${month}`) ?? 0;
-  }
-
-  add(customer: string, month: string, usd: number): void {
-    const key = `${customer}\u0000${month}`;
-    this.totals.set(key, (this.totals.get(key) ?? 0) + usd);
-  }
-}
 
 /** One model step, as the cost tracker saw it. */
 export type CallRecord = {
   customer?: string;
   plan?: string;
+  /** The Weflayr feature run this step belongs to. */
   runId?: string;
   call: string;
   feature: string;
+  /** The model that answered. With a routing strategy, the model the strategy picked. */
   model: string;
   /** The step number inside the agent run, starting at 0. A tool loop makes several steps. */
   step: number;
   inputTokens: number;
   outputTokens: number;
+  /** An estimate from your price table, used between reads of Weflayr's real cost. */
   costUsd: number;
-  /** "estimated" when the model is in your price table, "none" when it is not. */
   costSource: "estimated" | "none";
+  /** Changes the gateway made to the request, from `weflayr_warnings`. */
+  warnings?: unknown[];
   at: number;
 };
 
 /** What the budget guard puts on `result.tripwire.metadata` when it stops a run. */
 export type BudgetTripwire = {
   type: "weflayr-budget";
-  /** "month" for the customer's monthly budget, "run" for the budget of one run. */
-  scope: "month" | "run";
+  /** "month" for the customer's monthly budget, "run" for one run's budget, "margin" for a margin status. */
+  scope: "month" | "run" | "margin";
   customer?: string;
-  /** Set when scope is "month". */
+  /** Set when scope is "month" or "margin". */
   month?: string;
-  limitUsd: number;
-  spentUsd: number;
-};
-
-/** Switch a customer to a cheaper model once they have used part of their monthly budget. */
-export type Downgrade = {
-  /** The model to use instead. */
-  model: string;
-  /** The share of the budget, from 0 to 1, after which new runs use `model`. Defaults to 0.8. */
-  at?: number;
+  /** Set when scope is "month" or "run". */
+  limitUsd?: number;
+  spentUsd?: number;
+  /** Set when scope is "margin". */
+  riskStatus?: RiskStatus;
 };
 
 export type BudgetStatus = {
@@ -104,19 +94,31 @@ export type BudgetStatus = {
   allowed: boolean;
 };
 
+export type MarginStatus = {
+  customer: string;
+  month: string;
+  riskStatus: RiskStatus | null;
+  revenue: number | null;
+  cost: number | null;
+  marginPct: number | null;
+};
+
 export type WeflayrOptions = {
-  /** Defaults to the WEFLAYR_API_KEY environment variable. */
+  /** The gateway key. Defaults to WEFLAYR_API_KEY. */
   apiKey?: string;
   baseURL?: string;
+  /** The key for Weflayr's management API (cost, margin, revenue, tags). Defaults to WEFLAYR_MANAGEMENT_KEY, then WEFLAYR_API_KEY. */
+  managementKey?: string;
+  managementURL?: string;
   /** Maps each call name to the feature it belongs to. A call that is not listed is filed under `defaultFeature`. */
   features?: Record<string, string>;
   /** Defaults to "other". */
   defaultFeature?: string;
-  /** Dollars per million tokens, used to price each step. */
+  /** Dollars per million tokens, used to estimate each step until Weflayr's real cost is read. */
   prices?: Prices;
   /**
    * Who the call is for. Defaults to the `weflayr-customer` request context key,
-   * then to Mastra's resource id (the `resource` you pass for memory).
+   * then to Mastra's resource id.
    */
   customer?: (requestContext: RequestContext) => string | undefined;
   /** The customer's plan. Defaults to the `weflayr-plan` request context key. */
@@ -133,18 +135,42 @@ export type WeflayrOptions = {
   runBudget?:
     | number
     | ((requestContext: RequestContext) => number | null | undefined);
-  /** Defaults to a MemorySpendStore. Use your own store when you run more than one server. */
-  spend?: SpendStore;
-  /** Called after every model step with its tokens and cost. Errors here are logged and never fail the run. */
-  onCall?: (record: CallRecord) => void | Promise<void>;
   /**
-   * What the budget guard does when `budget` or the spend store throws.
+   * Where monthly spend comes from. "weflayr" reads each customer's real cost from Weflayr (needs a
+   * management key). "memory" (the default) adds up estimates from `prices` in this process. Or pass
+   * your own store.
+   */
+  spend?: "weflayr" | "memory" | SpendStore;
+  /** Tuning for `spend: "weflayr"`. */
+  weflayrSpend?: WeflayrSpendOptions;
+  /** Margin statuses that stop a customer's run, for example ["unprofitable"]. Needs a management key. */
+  stopOnMargin?: RiskStatus[];
+  /** How long a margin status read from Weflayr is used. Defaults to 5 minutes. */
+  marginRefreshMs?: number;
+  /** Called after every model step with its tokens and estimated cost. Errors here are logged and never fail the run. */
+  onCall?: (record: CallRecord) => void | Promise<void>;
+  /** Called when the gateway changed a request. Defaults to a console warning. */
+  onWarnings?: (warnings: unknown[], record: CallRecord) => void;
+  /**
+   * What the budget guard does when a budget, spend or margin check throws.
    * "allow" (the default) logs a warning and lets the step run. "block" stops the run.
    */
   onBudgetError?: "allow" | "block";
 };
 
 type ModelChoice = string | ((requestContext: RequestContext) => string);
+
+const RUN_ID = /^[0-9a-f]{32}$/;
+
+/** A new Weflayr feature run id: 32 lowercase hex characters. */
+export function newRunId(): string {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+/** The model id for a Weflayr routing strategy, optionally pinned to one version. */
+export function strategy(id: string, version?: number | string): string {
+  return version === undefined ? `strategy/${id}` : `strategy/${id}:${version}`;
+}
 
 /** The month a timestamp falls in, in UTC, written YYYY-MM. */
 export function currentMonth(now: number = Date.now()): string {
@@ -170,15 +196,49 @@ function describe(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).slice(0, 300);
 }
 
+/** The model that answered, from the response, and the gateway's warnings when the response body is available. */
+function readResponse(args: { chunks?: unknown[]; rawResponse?: unknown }) {
+  let model: string | undefined;
+  for (const chunk of args.chunks ?? []) {
+    const item = chunk as { type?: string; payload?: { modelId?: unknown }; modelId?: unknown };
+    if (item.type !== "response-metadata") continue;
+    model = asString(item.payload?.modelId) ?? asString(item.modelId);
+    if (model) break;
+  }
+  const body = (args.rawResponse as { body?: { weflayr_warnings?: unknown } } | undefined)?.body;
+  const warnings = Array.isArray(body?.weflayr_warnings) ? body.weflayr_warnings : undefined;
+  return { model, warnings };
+}
+
 export class Weflayr {
   private readonly spend: SpendStore;
+  private apiClient?: WeflayrApi;
+  private readonly answered = new WeakMap<object, { model?: string; warnings?: unknown[] }>();
+  private readonly runSpend = new WeakMap<object, number>();
+  private readonly runIds = new WeakMap<object, string>();
+  private readonly margins = new Map<string, { status: MarginStatus; fetchedAt: number }>();
 
   constructor(private readonly options: WeflayrOptions = {}) {
-    this.spend = options.spend ?? new MemorySpendStore();
+    const spend = options.spend ?? "memory";
+    this.spend =
+      spend === "memory"
+        ? new MemorySpendStore()
+        : spend === "weflayr"
+          ? new WeflayrSpendStore(this.api, options.weflayrSpend)
+          : spend;
   }
 
   get baseURL(): string {
     return this.options.baseURL ?? GATEWAY_URL;
+  }
+
+  /** Weflayr's management API: cost, margin, revenue and customer tags. */
+  get api(): WeflayrApi {
+    this.apiClient ??= new WeflayrApi({
+      apiKey: this.options.managementKey,
+      baseURL: this.options.managementURL,
+    });
+    return this.apiClient;
   }
 
   private apiKey(): string {
@@ -192,11 +252,26 @@ export class Weflayr {
     meta: CallContext,
     requestContext: RequestContext = new RequestContext(),
   ): RequestContext {
+    if (meta.runId !== undefined && !RUN_ID.test(meta.runId)) {
+      throw new Error("A Weflayr run id is 32 lowercase hex characters. Make one with newRunId().");
+    }
     if (meta.customer !== undefined) requestContext.set(CUSTOMER_KEY, meta.customer);
     if (meta.plan !== undefined) requestContext.set(PLAN_KEY, meta.plan);
     if (meta.runId !== undefined) requestContext.set(RUN_KEY, meta.runId);
     if (meta.tags !== undefined) requestContext.set(TAGS_KEY, meta.tags);
     return requestContext;
+  }
+
+  /** The Weflayr feature run of a request context. One is made the first time it is needed. */
+  runId(requestContext: RequestContext): string {
+    const given = asString(requestContext.get(RUN_KEY));
+    if (given && RUN_ID.test(given)) return given;
+    let id = this.runIds.get(requestContext);
+    if (!id) {
+      id = newRunId();
+      this.runIds.set(requestContext, id);
+    }
+    return id;
   }
 
   /** The customer, plan, run id and tags this package reads from a request context. */
@@ -215,7 +290,7 @@ export class Weflayr {
     return {
       customer,
       plan,
-      runId: asString(requestContext.get(RUN_KEY)),
+      runId: this.runId(requestContext),
       tags:
         tags && typeof tags === "object"
           ? (tags as Record<string, string>)
@@ -233,11 +308,11 @@ export class Weflayr {
   metadata(call: string, meta: CallContext = {}): string {
     const tags: Record<string, string> = { ...meta.tags };
     if (meta.plan) tags.plan = meta.plan;
-    if (meta.runId) tags.run_id = meta.runId;
     return asciiJson({
       feature_name: this.featureOf(call),
       call_name: call,
       ...(meta.customer ? { customer_name: meta.customer } : {}),
+      ...(meta.runId ? { feature_run_uuid: meta.runId } : {}),
       ...(Object.keys(tags).length ? { tags } : {}),
     });
   }
@@ -261,52 +336,19 @@ export class Weflayr {
   }
 
   /**
-   * An agent model that goes through the gateway. Each request reads the customer, plan and run id
-   * from its request context. `modelId` can be a function of the request context, to pick a model by plan.
+   * An agent model that goes through the gateway. Each request reads the customer, plan and run from
+   * its request context. `modelId` is a model name or `strategy(id, version)`, or a function of the
+   * request context that returns one.
    */
   model(
     modelId: ModelChoice,
-    options: { call: string; downgrade?: Downgrade },
-  ): (args: {
-    requestContext: RequestContext;
-  }) => Promise<OpenAICompatibleConfig> {
-    return async ({ requestContext }) => {
-      const meta = this.read(requestContext);
-      const chosen = this.resolveModel(modelId, requestContext);
-      const cheaper = await this.downgradeTo(
-        chosen,
-        options.downgrade,
-        meta.customer,
-        requestContext,
-      );
-      return this.config(cheaper ?? chosen, {
+    options: { call: string },
+  ): (args: { requestContext: RequestContext }) => OpenAICompatibleConfig {
+    return ({ requestContext }) =>
+      this.config(this.resolveModel(modelId, requestContext), {
         call: options.call,
-        ...meta,
-        tags: cheaper ? { ...meta.tags, downgraded_from: chosen } : meta.tags,
+        ...this.read(requestContext),
       });
-    };
-  }
-
-  private async downgradeTo(
-    chosen: string,
-    downgrade: Downgrade | undefined,
-    customer: string | undefined,
-    requestContext: RequestContext,
-  ): Promise<string | undefined> {
-    if (!downgrade || !customer || !this.options.budget) return undefined;
-    if (downgrade.model === chosen) return undefined;
-    try {
-      const status = await this.budget(customer, requestContext);
-      if (status.limitUsd === null) return undefined;
-      const at = Math.min(Math.max(downgrade.at ?? 0.8, 0), 1);
-      return status.spentUsd >= status.limitUsd * at ? downgrade.model : undefined;
-    } catch (error) {
-      console.warn(
-        "mastra-weflayr could not check a budget, so the usual model runs:",
-        describe(error),
-      );
-      return undefined;
-    }
   }
 
   /** Dollars for a step, or undefined when the model is not in the price table. */
@@ -348,9 +390,42 @@ export class Weflayr {
     };
   }
 
+  /** The customer's margin status for the month, from Weflayr. Cached for `marginRefreshMs`. */
+  async margin(customer: string, month: string = currentMonth()): Promise<MarginStatus> {
+    const key = `${customer}\u0000${month}`;
+    const cached = this.margins.get(key);
+    if (cached && Date.now() - cached.fetchedAt < (this.options.marginRefreshMs ?? 300_000)) {
+      return cached.status;
+    }
+    const row = await this.api.customerMargin(customer, month);
+    const status: MarginStatus = {
+      customer,
+      month,
+      riskStatus: row?.risk_status ?? null,
+      revenue: row?.revenue ?? null,
+      cost: row?.cost ?? null,
+      marginPct: row?.margin_pct ?? null,
+    };
+    this.margins.set(key, { status, fetchedAt: Date.now() });
+    return status;
+  }
+
+  /** Sets tags such as the plan on customers in Weflayr, so its dashboards and margin views can split by them. */
+  tagCustomers(customers: Record<string, Record<string, string | null>>) {
+    return this.api.setCustomerTags(
+      Object.entries(customers).map(([customer_name, tags]) => ({ customer_name, tags })),
+    );
+  }
+
+  /** What this run has spent so far, in dollars, from your price table. */
+  runCost(requestContext: RequestContext): number {
+    return this.runSpend.get(requestContext) ?? 0;
+  }
+
   /**
-   * An input processor that runs before every model step. When the customer has used their monthly
-   * budget, it stops the run before the model is called. The result has `tripwire.metadata` set to a
+   * An input processor that runs before every model step. It stops the run before the model is
+   * called when the run has used its run budget, the customer has used their monthly budget, or the
+   * customer's margin status is in `stopOnMargin`. The result has `tripwire.metadata` set to a
    * BudgetTripwire. Because it runs before every step, it also stops a tool loop part way.
    */
   budgetGuard(): InputProcessor<BudgetTripwire> {
@@ -376,13 +451,13 @@ export class Weflayr {
             );
           }
         }
-        if (!customer || !this.options.budget) return;
-        let status: BudgetStatus;
+        if (!customer) return;
+        const context = requestContext ?? new RequestContext();
+        let status: BudgetStatus | null = null;
+        let margin: MarginStatus | null = null;
         try {
-          status = await this.budget(
-            customer,
-            requestContext ?? new RequestContext(),
-          );
+          if (this.options.budget) status = await this.budget(customer, context);
+          if (this.options.stopOnMargin?.length) margin = await this.margin(customer);
         } catch (error) {
           if (this.options.onBudgetError === "block") {
             abort(`Could not check the AI budget for ${customer}.`);
@@ -393,43 +468,58 @@ export class Weflayr {
           );
           return;
         }
-        if (status.allowed || status.limitUsd === null) return;
-        abort(
-          `${customer} has used ${dollars(status.spentUsd)} of its ${dollars(status.limitUsd)} monthly AI budget.`,
-          {
+        if (status && !status.allowed && status.limitUsd !== null) {
+          abort(
+            `${customer} has used ${dollars(status.spentUsd)} of its ${dollars(status.limitUsd)} monthly AI budget.`,
+            {
+              metadata: {
+                type: "weflayr-budget",
+                scope: "month",
+                customer,
+                month: status.month,
+                limitUsd: status.limitUsd,
+                spentUsd: status.spentUsd,
+              },
+            },
+          );
+        }
+        if (margin?.riskStatus && this.options.stopOnMargin?.includes(margin.riskStatus)) {
+          abort(`${customer} is ${margin.riskStatus.replace("_", " ")} on AI margin this month.`, {
             metadata: {
               type: "weflayr-budget",
-              scope: "month",
+              scope: "margin",
               customer,
-              month: status.month,
-              limitUsd: status.limitUsd,
-              spentUsd: status.spentUsd,
+              month: margin.month,
+              riskStatus: margin.riskStatus,
             },
-          },
-        );
-      },
-    };
-  }
-
-  /**
-   * An input processor that notes which model answered each step, so a fallback model is priced as
-   * itself. Needs @mastra/core 1.34 or later (the supported range).
-   */
-  modelCapture(): InputProcessor {
-    return {
-      id: MODEL_CAPTURE_ID,
-      processLLMResponse: async ({ model, requestContext }) => {
-        const id = (model as { modelId?: unknown } | undefined)?.modelId;
-        if (requestContext && typeof id === "string" && id !== "") {
-          this.answered.set(requestContext, id);
+          });
         }
       },
     };
   }
 
   /**
-   * An output processor that runs after every model step. It prices the step's tokens, adds the cost
-   * to the customer's monthly spend and calls `onCall`. It never fails the run.
+   * An input processor that notes which model answered each step, so a strategy's pick or a fallback
+   * model is recorded and priced as itself, and keeps the gateway's warnings.
+   */
+  modelCapture(): InputProcessor {
+    return {
+      id: MODEL_CAPTURE_ID,
+      processLLMResponse: async ({ model, chunks, rawResponse, requestContext }) => {
+        if (!requestContext) return;
+        const read = readResponse({ chunks, rawResponse });
+        const declared = asString((model as { modelId?: unknown } | undefined)?.modelId);
+        this.answered.set(requestContext, {
+          model: read.model ?? declared,
+          warnings: read.warnings,
+        });
+      },
+    };
+  }
+
+  /**
+   * An output processor that runs after every model step. It prices the step from your price table,
+   * adds it to the run's and the customer's spend, and calls `onCall`. It never fails the run.
    */
   costTracker(options: { call: string; model: ModelChoice }): OutputProcessor {
     return {
@@ -442,15 +532,11 @@ export class Weflayr {
       }) => {
         try {
           const meta = this.read(requestContext);
-          const answered = requestContext
-            ? this.answered.get(requestContext)
-            : undefined;
+          const answered = requestContext ? this.answered.get(requestContext) : undefined;
+          if (requestContext) this.answered.delete(requestContext);
           const model =
-            answered ??
-            this.resolveModel(
-                  options.model,
-                  requestContext ?? new RequestContext(),
-                );
+            answered?.model ??
+            this.resolveModel(options.model, requestContext ?? new RequestContext());
           const inputTokens = usage?.inputTokens ?? 0;
           const outputTokens = usage?.outputTokens ?? 0;
           const estimated = this.estimateCost(model, inputTokens, outputTokens);
@@ -467,6 +553,7 @@ export class Weflayr {
             outputTokens,
             costUsd: estimated ?? 0,
             costSource: estimated === undefined ? "none" : "estimated",
+            ...(answered?.warnings?.length ? { warnings: answered.warnings } : {}),
             at,
           };
           if (requestContext && record.costUsd > 0) {
@@ -477,6 +564,14 @@ export class Weflayr {
           }
           if (meta.customer && record.costUsd > 0) {
             await this.spend.add(meta.customer, currentMonth(at), record.costUsd);
+          }
+          if (record.warnings) {
+            (this.options.onWarnings ??
+              ((warnings) =>
+                console.warn("The Weflayr gateway changed a request:", JSON.stringify(warnings))))(
+              record.warnings,
+              record,
+            );
           }
           await this.options.onCall?.(record);
         } catch (error) {
@@ -491,35 +586,38 @@ export class Weflayr {
   }
 
   /**
-   * The model, budget guard and cost tracker for one agent, with the same call name in all three.
-   * Spread it into `new Agent({ ... })`.
+   * The model, budget guard, model capture and cost tracker for one agent, with the same call name in
+   * all of them. Spread it into `new Agent({ ... })`.
    */
-  agent(options: { call: string; model: ModelChoice; downgrade?: Downgrade }) {
+  agent(options: { call: string; model: ModelChoice }) {
     return {
-      model: this.model(options.model, {
-        call: options.call,
-        downgrade: options.downgrade,
-      }),
+      model: this.model(options.model, { call: options.call }),
       inputProcessors: [this.budgetGuard(), this.modelCapture()],
       outputProcessors: [this.costTracker(options)],
     };
   }
 
   /**
-   * A tool the agent can call to see how much of its budget is left, so it can plan around it.
-   * Add it to the agent's `tools`.
+   * A tool the agent can call to see how much of its budget is left and its margin status, so it can
+   * plan around it. Add it to the agent's `tools`.
    */
   budgetTool() {
     return createTool({
       id: BUDGET_TOOL_ID,
       description:
-        "Shows how much of the AI budget is left for this customer this month and for this run, in US dollars. Call it before expensive work.",
+        "Shows how much of the AI budget is left for this customer this month and for this run, in US dollars, and the customer's margin status. Call it before expensive work.",
       execute: async (_input, context) => {
         const requestContext = context?.requestContext ?? new RequestContext();
         const { customer } = this.read(requestContext);
         const runLimit = this.runLimit(requestContext);
         const runSpent = this.runSpend.get(requestContext) ?? 0;
         const month = customer ? await this.budget(customer, requestContext) : null;
+        let marginStatus: RiskStatus | null = null;
+        if (customer && this.options.stopOnMargin?.length) {
+          marginStatus = await this.margin(customer)
+            .then((margin) => margin.riskStatus)
+            .catch(() => null);
+        }
         return {
           customer: customer ?? null,
           month: month && {
@@ -533,14 +631,10 @@ export class Weflayr {
             remainingUsd:
               runLimit === null ? null : Math.max(runLimit - runSpent, 0),
           },
+          marginStatus,
         };
       },
     });
-  }
-
-  /** What this run has spent so far, in dollars. A run is everything done with one request context. */
-  runCost(requestContext: RequestContext): number {
-    return this.runSpend.get(requestContext) ?? 0;
   }
 
   private runLimit(requestContext: RequestContext | undefined): number | null {
@@ -552,9 +646,6 @@ export class Weflayr {
         : option;
     return typeof limit === "number" ? limit : null;
   }
-
-  private readonly answered = new WeakMap<object, string>();
-  private readonly runSpend = new WeakMap<object, number>();
 
   private resolveModel(modelId: ModelChoice, requestContext: RequestContext) {
     return typeof modelId === "function" ? modelId(requestContext) : modelId;
