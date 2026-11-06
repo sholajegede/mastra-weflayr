@@ -21,12 +21,17 @@ Then make sure `latest` points at the new version:
 
 ## One time, for tagged releases
 
-1. Create the repository `sholajegede/mastra-weflayr` on GitHub and push `main`.
-2. Create an npm automation token that can publish `mastra-weflayr`.
-3. Add it as the secret `NPM_TOKEN`, and create an environment named `npm`
-   (add a required reviewer if you want a manual approval).
+1. Push `main` to `sholajegede/mastra-weflayr` on GitHub.
+2. On npmjs.com open the package, then Settings, then Trusted Publisher, and choose
+   GitHub Actions. Fill in organization or user `sholajegede`, repository `mastra-weflayr`,
+   workflow filename `release.yml` and environment `npm`. Allow `npm publish`.
+3. In the GitHub repository, create an environment named `npm`. Add a required
+   reviewer if you want a manual approval before each publish.
 4. Turn on branch protection for `main`: require the `CI` checks and a pull
    request.
+
+No npm token is stored anywhere. The workflow proves its identity to npm for each
+publish.
 
 ## Each release
 
